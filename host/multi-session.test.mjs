@@ -16,6 +16,7 @@ import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { makePeerHello, checkServerProof } from "./auth-token.js";
 
 const SERVER = path.join(import.meta.dirname, "mcp-server.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -30,17 +31,20 @@ function isolatedEnv(port) {
   return { env: { ...process.env, HOME: home }, home, token };
 }
 
-// A stand-in for the browser's native host: a silent TCP client (so the primary
-// classifies it as a native host, not a client MCP server) that answers every
-// tool_request with MOCK_OK and reconnects if its primary dies.
+// A stand-in for the browser's native host: a TCP client that performs the
+// real mutual-auth handshake (nonce+MAC hello, verify server_proof), then
+// answers every tool_request with MOCK_OK and reconnects if its primary dies.
 function startMockNativeHost(port, token) {
   let sock;
   let alive = true;
   function connect() {
     sock = net.createConnection(port, "127.0.0.1", () => {
-      sock.write(JSON.stringify({ type: "native_hello", token }) + "\n");
+      const hello = makePeerHello(token, "native");
+      sock._nonce = hello.nonce;
+      sock.write(JSON.stringify({ type: "native_hello", nonce: hello.nonce, mac: hello.mac }) + "\n");
     });
     let buf = Buffer.alloc(0);
+    let verified = false;
     sock.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
       let i;
@@ -50,6 +54,15 @@ function startMockNativeHost(port, token) {
         if (!line) continue;
         let msg;
         try { msg = JSON.parse(line); } catch { continue; }
+        if (!verified) {
+          if (msg.type === "server_proof" && checkServerProof(token, "native", sock._nonce, msg.mac)) {
+            verified = true;
+          } else {
+            try { sock.destroy(); } catch {} // untrusted primary — reconnect to find the real one
+            return;
+          }
+          continue;
+        }
         if (msg.type === "tool_request") {
           sock.write(JSON.stringify({
             id: msg.id, type: "tool_response",

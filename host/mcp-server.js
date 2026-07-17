@@ -17,7 +17,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { z } from "zod";
-import { getAuthToken } from "./auth-token.js";
+import { getAuthToken, makePeerHello, checkPeerHello, makeServerProof, checkServerProof } from "./auth-token.js";
 
 
 const DEFAULT_PORT = 18765;
@@ -39,12 +39,6 @@ function getPort() {
 
 const TCP_PORT = getPort();
 const AUTH_TOKEN = getAuthToken();
-
-// Constant-time check that a peer presented the shared secret.
-function validAuth(token) {
-  if (typeof token !== "string" || token.length !== AUTH_TOKEN.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(AUTH_TOKEN));
-}
 
 // Opt-in tool consolidation (default OFF = full parity with official Claude in Chrome).
 // When enabled, 7 related tools are merged into 4 discriminated-union tools, dropping
@@ -77,6 +71,12 @@ const clientRequestMap = new Map();
 // Client mode: TCP connection to the primary
 let primarySocket = null;
 let clientBuffer = Buffer.alloc(0);
+// Mutual-auth state for the client→primary direction. The primary must prove it
+// knows the token (server_proof) before we send any tool traffic — otherwise a
+// rogue that merely binds the port could impersonate the primary.
+let primaryVerified = false;
+let pendingProofNonce = null;
+let proofTimer = null;
 
 // --- sendToExtension: works in both modes ---
 
@@ -100,7 +100,7 @@ function sendToExtension(tool, args) {
       nativeHostSocket.write(msg);
     } else {
       // Client mode: send to primary server
-      if (!primarySocket || primarySocket.destroyed) {
+      if (!primarySocket || primarySocket.destroyed || !primaryVerified) {
         clearTimeout(timer);
         pendingRequests.delete(id);
         reject(new Error("Lost connection to primary MCP server."));
@@ -171,11 +171,14 @@ function processLine(line) {
 
 const tcpServer = net.createServer((socket) => {
   // Every legitimate peer authenticates with a hello line the moment it
-  // connects: the native host sends {type:"native_hello",token}, a client MCP
-  // server sends {type:"client_hello",token}. Anything that presents a bad
-  // token, an unknown hello, or stays silent past the timeout is dropped — so a
-  // random local process (or another local user) can't hijack the port or the
-  // native host slot. This also replaces the old timing-based classification.
+  // connects: the native host sends {type:"native_hello",nonce,mac}, a client
+  // MCP server sends {type:"client_hello",nonce,mac}. Anything that presents a
+  // bad MAC, an unknown hello, or stays silent past the timeout is dropped — so
+  // a random local process (or another local user) can't hijack the port or the
+  // native host slot. After validating the peer, we reply with a server_proof so
+  // the peer can in turn confirm WE are the real primary (mutual auth; the token
+  // never crosses the wire). This also replaces the old timing-based
+  // classification.
   let classified = false;
   let earlyBuffer = Buffer.alloc(0);
 
@@ -208,16 +211,21 @@ const tcpServer = net.createServer((socket) => {
     let msg = null;
     try { msg = JSON.parse(firstLine); } catch {}
 
-    if (!msg || !validAuth(msg.token)) {
+    const role = msg && msg.type === "client_hello" ? "client"
+      : msg && msg.type === "native_hello" ? "native" : null;
+    if (!role || !checkPeerHello(AUTH_TOKEN, role, msg.nonce, msg.mac)) {
       socket.end(JSON.stringify({ type: "error", error: "Authentication failed." }) + "\n");
       return;
     }
-    if (msg.type === "client_hello") {
+    // Primary proves it knows the token, bound to the peer's nonce. A rogue that
+    // bound the port but lacks the token cannot forge this, so the peer will not
+    // trust the connection (closes the rogue-primary MITM). The token itself is
+    // never sent over the wire.
+    socket.write(JSON.stringify({ type: "server_proof", mac: makeServerProof(AUTH_TOKEN, role, msg.nonce) }) + "\n");
+    if (role === "client") {
       setupClientConnection(socket, rest);
-    } else if (msg.type === "native_hello") {
-      setupNativeHostConnection(socket, rest);
     } else {
-      socket.end(JSON.stringify({ type: "error", error: "Unknown hello type." }) + "\n");
+      setupNativeHostConnection(socket, rest);
     }
   });
 });
@@ -369,12 +377,23 @@ async function acquireRole() {
 function connectToPrimary() {
   mode = "client";
   clientBuffer = Buffer.alloc(0); // fresh connection — drop any stale partial line
+  primaryVerified = false;
+  pendingProofNonce = null;
   process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
 
   primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
     process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
-    // Authenticated handshake — the primary drops us without a valid token.
-    primarySocket.write(JSON.stringify({ type: "client_hello", token: AUTH_TOKEN }) + "\n");
+    // Send our hello (nonce + MAC). The token itself is never sent. We will only
+    // trust this primary once it replies with a valid server_proof — see below.
+    const hello = makePeerHello(AUTH_TOKEN, "client");
+    pendingProofNonce = hello.nonce;
+    primarySocket.write(JSON.stringify({ type: "client_hello", nonce: hello.nonce, mac: hello.mac }) + "\n");
+    // If the primary can't prove itself within 2s, it's a rogue (or dead) — drop it.
+    proofTimer = setTimeout(() => {
+      if (!primaryVerified && primarySocket) {
+        try { primarySocket.destroy(); } catch {}
+      }
+    }, 2000);
   });
 
   primarySocket.on("data", (chunk) => {
@@ -384,25 +403,38 @@ function connectToPrimary() {
       const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
       clientBuffer = clientBuffer.subarray(idx + 1);
       if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.type === "client_ack") continue;
-        if (msg.type === "error") {
-          process.stderr.write(`Primary server error: ${msg.error}\n`);
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+
+      // Gate: until the primary proves it knows the token, accept NOTHING else.
+      // A rogue that bound the port can't forge server_proof, so any other
+      // message here means we're talking to an impostor — disconnect.
+      if (!primaryVerified) {
+        if (msg.type === "server_proof" && checkServerProof(AUTH_TOKEN, "client", pendingProofNonce, msg.mac)) {
+          primaryVerified = true;
+          if (proofTimer) { clearTimeout(proofTimer); proofTimer = null; }
           continue;
         }
-        // Tool response routed back from primary
-        if (msg.id && pendingRequests.has(msg.id)) {
-          const { resolve, reject, timer } = pendingRequests.get(msg.id);
-          clearTimeout(timer);
-          pendingRequests.delete(msg.id);
-          if (msg.type === "tool_error") {
-            reject(new Error(msg.error || "Tool execution failed"));
-          } else {
-            resolve(msg.result);
-          }
+        try { primarySocket.destroy(); } catch {}
+        return;
+      }
+
+      if (msg.type === "client_ack") continue;
+      if (msg.type === "error") {
+        process.stderr.write(`Primary server error: ${msg.error}\n`);
+        continue;
+      }
+      // Tool response routed back from primary
+      if (msg.id && pendingRequests.has(msg.id)) {
+        const { resolve, reject, timer } = pendingRequests.get(msg.id);
+        clearTimeout(timer);
+        pendingRequests.delete(msg.id);
+        if (msg.type === "tool_error") {
+          reject(new Error(msg.error || "Tool execution failed"));
+        } else {
+          resolve(msg.result);
         }
-      } catch {}
+      }
     }
   });
 
@@ -412,6 +444,8 @@ function connectToPrimary() {
 
   primarySocket.on("close", () => {
     primarySocket = null;
+    primaryVerified = false;
+    if (proofTimer) { clearTimeout(proofTimer); proofTimer = null; }
     // Reject in-flight requests; a dead primary can't answer them.
     for (const [, { reject, timer }] of pendingRequests) {
       clearTimeout(timer);
