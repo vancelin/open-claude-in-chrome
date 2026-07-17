@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/noemica-io-open-claude-in-chrome-badge.png)](https://mseep.ai/app/noemica-io-open-claude-in-chrome)
+
 <p align="center">
   <img src="extension/icons/icon128.png" width="96" alt="Open Claude in Chrome">
 </p>
