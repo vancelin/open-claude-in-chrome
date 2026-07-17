@@ -937,6 +937,86 @@ const toolHandlers = {
     return { content: [{ type: "text", text: "Image upload is not yet implemented in this extension." }] };
   },
 
+  // Upload any local file to a file input using CDP Page.setInterceptFileChooserDialog
+  // This bypasses Chrome's user activation requirement for native file picker dialogs.
+  // filePath: absolute path on local disk (e.g. "C:/Users/Nodnarb/Desktop/video.mp4")
+  // selector: CSS selector to find the file input (default: 'input[type="file"]')
+  // inputIndex: which matching input to use (default: 0)
+  async upload_local_file(args) {
+    const { tabId, filePath, filePaths, selector = 'input[type="file"]', inputIndex = 0 } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    // Support both single filePath and array filePaths
+    const fileList = filePaths ? (Array.isArray(filePaths) ? filePaths : [filePaths]) : (filePath ? [filePath] : null);
+    if (!fileList || fileList.length === 0) return { content: [{ type: "text", text: "filePath or filePaths is required" }] };
+
+    await ensureAttached(tabId);
+
+    // Enable Page domain for file chooser interception
+    const state = attachedTabs.get(tabId);
+    if (!state.enabledDomains.has("Page")) {
+      await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
+      state.enabledDomains.add("Page");
+    }
+
+    // Set up the intercept BEFORE triggering the click
+    await chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: true });
+
+    // Wait for the fileChooserOpened event, then inject the file
+    const uploadPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        chrome.debugger.onEvent.removeListener(handler);
+        // Must disable the intercept on timeout too, otherwise it stays enabled
+        // for the life of the debugger session and silently swallows every later
+        // native file dialog the user opens on this tab.
+        chrome.debugger
+          .sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false })
+          .catch(() => {});
+        reject(new Error("Timed out waiting for fileChooserOpened event (10s)"));
+      }, 10000);
+
+      function handler(source, method, params) {
+        if (source.tabId !== tabId || method !== "Page.fileChooserOpened") return;
+        chrome.debugger.onEvent.removeListener(handler);
+        clearTimeout(timeout);
+
+        // params.backendNodeId is the "blessed" handle that Chrome allows setFileInputFiles on
+        chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
+          backendNodeId: params.backendNodeId,
+          files: fileList,
+        }).then(() => {
+          chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
+          resolve(`Files injected: ${fileList.join(', ')}`);
+        }).catch(err => {
+          chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
+          reject(err);
+        });
+      }
+
+      chrome.debugger.onEvent.addListener(handler);
+    });
+
+    // Trigger the file input click — this fires fileChooserOpened instead of OS dialog
+    // userGesture: true is required so Chrome treats it as a trusted event and fires fileChooserOpened
+    await cdp(tabId, "Runtime.evaluate", {
+      expression: `(() => {
+        const inputs = document.querySelectorAll(${JSON.stringify(selector)});
+        const inp = inputs[${inputIndex}];
+        if (!inp) return 'input_not_found';
+        inp.click();
+        return 'clicked';
+      })()`,
+      returnByValue: true,
+      userGesture: true,
+    });
+
+    try {
+      const result = await uploadPromise;
+      return { content: [{ type: "text", text: result }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `upload_local_file failed: ${err.message}` }] };
+    }
+  },
+
   async gif_creator(args) {
     return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
   },
