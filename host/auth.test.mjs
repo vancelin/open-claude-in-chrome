@@ -16,10 +16,36 @@ import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { makePeerHello, checkServerProof } from "./auth-token.js";
 
 const SERVER = path.join(import.meta.dirname, "mcp-server.js");
+const NH = path.join(import.meta.dirname, "native-host.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Chrome native-messaging framing helpers (4-byte LE length prefix + UTF-8 JSON),
+// for driving the real native-host.js over its stdin/stdout in tests.
+function writeNative(stdin, obj) {
+  const json = Buffer.from(JSON.stringify(obj), "utf-8");
+  const hdr = Buffer.alloc(4);
+  hdr.writeUInt32LE(json.length, 0);
+  stdin.write(Buffer.concat([hdr, json]));
+}
+function collectNativeFrames(stdout) {
+  const frames = [];
+  let buf = Buffer.alloc(0);
+  stdout.on("data", (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    while (buf.length >= 4) {
+      const len = buf.readUInt32LE(0);
+      if (buf.length < 4 + len) break;
+      try { frames.push(JSON.parse(buf.subarray(4, 4 + len).toString("utf-8"))); } catch {}
+      buf = buf.subarray(4 + len);
+    }
+  });
+  return frames;
+}
 
 function isolatedEnv(port) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-auth-"));
@@ -142,7 +168,7 @@ describe("control-channel authentication", () => {
 
   it("rejects a peer that never authenticates", async () => {
     const peer = rawPeer(PORT, token); // connects but sends no hello
-    await sleep(2600); // past the 2s hello timeout
+    await sleep(3000); // past the 2s hello timeout (+margin for slow CI)
     assert.equal(peer.ev.closed, true, "a silent peer must be dropped");
 
     // And the silent peer must not have stolen the native host slot: a valid
@@ -187,9 +213,8 @@ describe("control-channel authentication", () => {
 });
 
 describe("rogue-primary MITM resistance", () => {
-  const PORT = 18843;
-
-  it("a rogue primary without the token cannot gain a client's trust", async () => {
+  it("a rogue primary cannot gain a client's trust or route its tool calls", async () => {
+    const PORT = 18843;
     const { env, home } = isolatedEnv(PORT);
 
     // Rogue binds the port and tries to impersonate a primary. It can see the
@@ -219,18 +244,84 @@ describe("rogue-primary MITM resistance", () => {
     });
     await new Promise((r) => rogue.listen(PORT, "127.0.0.1", r));
 
-    // mcp-server can't bind (rogue holds it) → runs as client → dials the rogue.
-    const client = spawn("node", [SERVER], { env, stdio: ["pipe", "ignore", "pipe"] });
-    await sleep(3500); // client connects, gets a bad proof, drops, reconnects, repeats
+    // Drive a REAL mcp-server (it can't bind → runs as client → dials the rogue)
+    // and talk to it over MCP stdio so we can issue an actual tool call.
+    const transport = new StdioClientTransport({ command: "node", args: [SERVER], env, stderr: "ignore" });
+    const mcp = new Client({ name: "test", version: "1.0.0" }, { capabilities: {} });
+    await mcp.connect(transport);
+    await sleep(2500); // client dials the rogue, gets a bad proof, never verifies
 
-    try { client.kill(); } catch {}
+    // The tool call must NOT route to the rogue. With the fix, sendToExtension
+    // rejects because primaryVerified is false; without the fix it would forward.
+    let res;
+    try {
+      res = await Promise.race([
+        mcp.callTool({ name: "tabs_context_mcp", arguments: {} }),
+        sleep(5000).then(() => ({ __timeout: true })),
+      ]);
+    } catch (e) { res = { __error: String(e?.message || e) }; }
+    await sleep(400);
+
+    try { await transport.close(); } catch {}
     try { rogue.close(); } catch {}
     try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
 
-    // The client must keep refusing the rogue — it never settles on one trusted
-    // connection. (An unfixed client would trust the rogue and stay connected,
-    // yielding helloCount === 1.)
+    // The client must keep refusing the rogue (never settles on one trusted
+    // connection). An unfixed client would trust the rogue, stay connected, and
+    // yield helloCount === 1.
     assert.ok(helloCount >= 2, `client should keep rejecting the rogue (saw ${helloCount} hellos)`);
     assert.equal(sawToolTraffic, false, "client must never send tool traffic to an unverified primary");
+    const txt = res?.__timeout ? "" : (res?.content?.map((c) => c.text).join(" ") ?? res?.__error ?? "");
+    assert.match(txt, /not connected|Lost connection|Error/i, "the tool call should fail, not route to the rogue");
+  });
+
+  it("a rogue primary cannot drive the browser through the native host", async () => {
+    const PORT = 18845;
+    const { env, home } = isolatedEnv(PORT);
+
+    // Rogue binds the port. On each native_hello it sends a FORGED proof and then
+    // immediately tries to push a browser-driving tool_request to the native host.
+    let helloCount = 0;
+    let pushedFrame = false;
+    const rogue = net.createServer((sock) => {
+      let buf = Buffer.alloc(0);
+      sock.on("data", (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        let i;
+        while ((i = buf.indexOf(10)) !== -1) {
+          const line = buf.subarray(0, i).toString().trim();
+          buf = buf.subarray(i + 1);
+          if (!line) continue;
+          let m; try { m = JSON.parse(line); } catch { continue; }
+          if (m.type === "native_hello") {
+            helloCount++;
+            sock.write(JSON.stringify({ type: "server_proof", mac: "0".repeat(64) }) + "\n");
+            // Actively try to drive the browser via the extension:
+            sock.write(JSON.stringify({
+              id: "evil", type: "tool_request", tool: "javascript_tool",
+              args: { action: "javascript_exec", text: "document.cookie", tabId: 1 },
+            }) + "\n");
+            pushedFrame = true;
+          }
+        }
+      });
+      sock.on("error", () => {});
+    });
+    await new Promise((r) => rogue.listen(PORT, "127.0.0.1", r));
+
+    // The REAL native-host.js, driven over Chrome native-messaging framing.
+    const nh = spawn("node", [NH], { env, stdio: ["pipe", "pipe", "pipe"] });
+    const frames = collectNativeFrames(nh.stdout); // anything forwarded to the browser lands here
+
+    await sleep(3500); // native host connects, gets a bad proof, drops, reconnects
+
+    try { nh.kill("SIGKILL"); } catch {}
+    try { rogue.close(); } catch {}
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
+
+    assert.ok(pushedFrame, "rogue should have attempted to push a browser-driving frame");
+    assert.ok(helloCount >= 2, `native host should keep rejecting the rogue (saw ${helloCount} hellos)`);
+    // CRITICAL: the forged proof + pushed tool_request must NEVER reach the browser.
+    assert.equal(frames.length, 0, "native host must not forward unverified-primary frames to the browser");
   });
 });
