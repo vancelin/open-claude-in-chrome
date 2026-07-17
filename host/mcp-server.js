@@ -42,7 +42,7 @@ const AUTH_TOKEN = getAuthToken();
 
 // Opt-in tool consolidation (default OFF = full parity with official Claude in Chrome).
 // When enabled, 7 related tools are merged into 4 discriminated-union tools, dropping
-// the registered tool count from 18 to 15. This is only useful for backends that reject
+// the registered tool count from 19 to 16. This is only useful for backends that reject
 // the `tool_reference` content blocks Claude Code emits in "Tool Search" mode (AWS Bedrock,
 // Vertex AI, some OpenAI-compatible proxies, older models). See README "Tool consolidation".
 //
@@ -488,8 +488,8 @@ async function callTool(toolName, args) {
 }
 
 // --- MCP Server ---
-// Default: all 18 tools (parity with official Claude in Chrome).
-// With config.consolidateTools=true: 15 consolidated tools (see CONSOLIDATE above).
+// Default: all 19 tools (parity with official Claude in Chrome).
+// With config.consolidateTools=true: 16 consolidated tools (see CONSOLIDATE above).
 
 const server = new McpServer({
   name: "open-claude-in-chrome",
@@ -765,7 +765,7 @@ server.tool(
 
 // --- Consolidated tools (only registered when CONSOLIDATE is enabled) ---
 // These merge the parity tools gated out above into discriminated-union tools,
-// lowering the registered tool count from 18 to 15. Backend functionality is
+// lowering the registered tool count from 19 to 16. Backend functionality is
 // identical — the same underlying callTool() targets are dispatched by action/type.
 // NOTE: resize_window and upload_image are intentionally NOT merged, to avoid
 // surprising side effects (a "read" that resizes) and low-value single-type unions.
