@@ -676,9 +676,12 @@ const toolHandlers = {
           if (resp?.result?.error) {
             return { content: [{ type: "text", text: `Error: ${resp.result.error}` }] };
           }
-          if (!coordinate && resp?.result?.success) {
-            coordinate = [resp.result.x, resp.result.y];
-          }
+          // NOTE: content.js scrollToRef already calls scrollIntoView({block:"center"})
+          // and returns viewport-relative center coords. We must NOT feed those into
+          // window.scrollTo (which expects document-absolute coords) — doing so yanks
+          // the page back and undoes the scrollIntoView. So when a ref was given, rely
+          // on scrollIntoView and only run window.scrollTo if the caller passed a
+          // coordinate themselves.
         }
         // Scroll target element into view via JS
         if (coordinate) {
